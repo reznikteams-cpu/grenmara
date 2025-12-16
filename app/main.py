@@ -92,9 +92,17 @@ async def main() -> None:
                 log.info("KB warmed successfully (new chunks=%s)", indexed)
             else:
                 log.info("KB already present (no new chunks indexed)")
-        except Exception as e:
-            _set_kb_state(False)
-            log.exception("KB startup failed, continuing without KB: %s", e)
+       except Exception as e:
+    try:
+        from app.kb.state import kb_mark_ready
+        kb_mark_ready(False)
+    except Exception:
+        pass
+
+    log.exception("KB reload failed: %s", e)
+    await update.effective_message.reply_text(
+        "Ошибка при обновлении KB ❌\nСмотри логи сервера."
+    )
 
     scheduler = SchedulerService(db=db, settings=settings)
     scheduler.start()
