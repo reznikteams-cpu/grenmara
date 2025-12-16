@@ -1,9 +1,13 @@
 import os
 import time
 import logging
-import asyncio
 
-from app.kb.state import kb_is_ready, kb_mark_ready, kb_set_last_load_ts
+from app.kb.state import (
+    kb_is_ready,
+    kb_mark_ready,
+    kb_set_last_load_ts,
+    get_kb_loading_lock,
+)
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +19,7 @@ class KBLoadError(RuntimeError):
 def _env_flag(name: str, default: bool = False) -> bool:
     """
     Нормальный парсер булевых env-флагов.
-    Важно: строка "0" должна быть False, иначе будет вечная путаница.
+    "0" -> False, "1" -> True.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -25,20 +29,8 @@ def _env_flag(name: str, default: bool = False) -> bool:
         return True
     if raw in ("0", "false", "no", "n", "off", ""):
         return False
-    # Если прилетело что-то странное — считаем True, но явно логируем.
     log.warning("Env %s has unexpected value %r; treating as True", name, raw)
     return True
-
-
-def _get_lock() -> asyncio.Lock:
-    """
-    Создаём lock лениво, чтобы не привязать его к "не тому" event loop.
-    """
-    lock = getattr(_get_lock, "_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        setattr(_get_lock, "_lock", lock)
-    return lock
 
 
 async def ensure_kb_loaded(load_fn):
@@ -48,7 +40,7 @@ async def ensure_kb_loaded(load_fn):
     if kb_is_ready():
         return True
 
-    lock = _get_lock()
+    lock = get_kb_loading_lock()
     async with lock:
         if kb_is_ready():
             return True
