@@ -41,25 +41,63 @@ def _looks_complex_scene(text: str) -> bool:
     return any(m in low for m in markers)
 
 
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower().replace("ё", "е")
+    # убрать «мусор» по краям: эмодзи, тире, двоеточия, маркеры
+    s = re.sub(r"^[^\wа-яё]+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[^\wа-яё]+$", "", s, flags=re.IGNORECASE)
+    # схлопнуть пробелы
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _guess_key(animal_scene: str) -> str:
+    """
+    Берем первое 'слово из букв' (кириллица/латиница), игнорируя эмодзи/знаки.
+    Пример: '🐘 Слон на дороге' -> 'слон'
+            'Тигрица, на которую нападают' -> 'тигрица'
+    """
+    t = _norm(animal_scene)
+    m = re.search(r"[a-zа-яё]+", t, flags=re.IGNORECASE)
+    return (m.group(0) if m else t).strip()
+
+
 def _extract_symbolism_entry(raw_text: str, key: str) -> str | None:
     """
-    Пытаемся вытащить блок по ключу (животное/символ).
-    Алгоритм: найти строку, где ключ идёт как заголовок/в начале/отдельное слово,
-    затем вернуть следующие строки до пустой строки или следующего "похожего" заголовка.
+    Находит блок по ключу даже если заголовок выглядит как:
+    '🐘 Слон', '— Слон', 'Слон:', 'СЛОН', etc.
     """
-    if not raw_text or not key:
+    if not raw_text:
+        return None
+
+    k = _norm(key)
+    if not k:
         return None
 
     lines = raw_text.splitlines()
-    k = key.strip().lower()
+
+    def clean_heading(line: str) -> str:
+        # нормализуем строку и отдельно убираем распространенные разделители внутри
+        x = _norm(line)
+        x = x.replace(":", "").replace("—", " ").replace("-", " ")
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
 
     start_idx = None
     for i, ln in enumerate(lines):
         l = ln.strip()
         if not l:
             continue
-        ll = l.lower()
-        if ll == k or ll.startswith(k) or re.search(rf"\b{re.escape(k)}\b", ll):
+
+        h = clean_heading(l)
+
+        # точное совпадение заголовка: "слон" или "слон (что-то)" или "слон — ..."
+        if h == k or h.startswith(k + " ") or h.startswith(k + "("):
+            start_idx = i
+            break
+
+        # ключ как отдельное слово в начале (после эмодзи/тире): "слон ..." 
+        if re.match(rf"^{re.escape(k)}\b", h, flags=re.IGNORECASE):
             start_idx = i
             break
 
@@ -68,21 +106,28 @@ def _extract_symbolism_entry(raw_text: str, key: str) -> str | None:
 
     out = [lines[start_idx].rstrip()]
 
-    for j in range(start_idx + 1, min(start_idx + 120, len(lines))):
+    # соберем тело до следующего “похожего заголовка” или пустой строки
+    for j in range(start_idx + 1, min(start_idx + 200, len(lines))):
         ln = lines[j].rstrip()
         if not ln.strip():
             if len(out) > 1:
                 break
             continue
 
-        # эвристика остановки на "новом заголовке"
-        if re.match(r"^[A-ZА-ЯЁ0-9🐘🦊🐺🦁🦅🦂🕷️].{0,45}$", ln.strip()) and len(out) > 3:
-            break
+        # если встретили новый заголовок (эмодзи/тире + одно слово/короткая строка)
+        h = clean_heading(ln)
+        if len(out) > 3 and (len(h) <= 40) and re.match(r"^[a-zа-яё0-9 ]+$", h, flags=re.IGNORECASE):
+            # эвристика: короткая "чистая" строка — вероятный заголовок следующего символа
+            # но не режем, если это продолжение вопроса/списка
+            if not h.startswith(("—", "-", "*")):
+                # если это не похоже на продолжение пункта
+                break
 
         out.append(ln)
 
     text = "\n".join(out).strip()
     return text if text else None
+
 
 
 async def start(update, context, repo, settings):
