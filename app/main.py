@@ -26,8 +26,8 @@ async def main():
 
     # KB warm start (one-time)
     try:
-    await _startup_kb(db, settings)
-except Exception as e:
+        await _startup_kb(db, settings)
+    except Exception as e:
     log.exception("KB startup failed, continuing without KB: %s", e)
 
 
