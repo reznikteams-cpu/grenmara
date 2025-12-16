@@ -1,7 +1,10 @@
 from __future__ import annotations
+
 import json
+import math
 from typing import Optional
 from app.storage.db import Database
+
 
 class Repo:
     def __init__(self, db: Database):
@@ -23,7 +26,10 @@ class Repo:
         return rows[0] if rows else None
 
     def inc_free_used(self, user_id: int) -> None:
-        self.db.execute("UPDATE users SET free_messages_used=free_messages_used+1, last_seen_at=datetime('now') WHERE user_id=?", (user_id,))
+        self.db.execute(
+            "UPDATE users SET free_messages_used=free_messages_used+1, last_seen_at=datetime('now') WHERE user_id=?",
+            (user_id,),
+        )
 
     def set_subscription(self, user_id: int, is_active: bool) -> None:
         self.db.execute("UPDATE users SET is_active_subscription=? WHERE user_id=?", (1 if is_active else 0, user_id))
@@ -67,6 +73,55 @@ class Repo:
         out = []
         for r in rows:
             out.append((int(r["id"]), r["content"], json.loads(r["embedding_json"])))
+        return out
+
+    # --- NEW: read raw document text (needed for "Символизм" exact phrasing/questions) ---
+    def get_document_raw_text_by_title(self, title: str) -> str | None:
+        rows = self.db.query("SELECT raw_text FROM kb_documents WHERE title=? ORDER BY id DESC LIMIT 1", (title,))
+        if not rows:
+            return None
+        return rows[0]["raw_text"]
+
+    def get_document_raw_text_by_source_key_prefix(self, prefix: str) -> str | None:
+        # e.g. prefix "gdocs:...:" if you want
+        rows = self.db.query(
+            "SELECT raw_text FROM kb_documents WHERE source_key LIKE ? ORDER BY id DESC LIMIT 1",
+            (prefix + "%",),
+        )
+        if not rows:
+            return None
+        return rows[0]["raw_text"]
+
+    # --- NEW: semantic KB search over chunks ---
+    @staticmethod
+    def _cosine(a: list[float], b: list[float]) -> float:
+        if not a or not b or len(a) != len(b):
+            return -1.0
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for i in range(len(a)):
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        if na <= 0.0 or nb <= 0.0:
+            return -1.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
+
+    def kb_search(self, query_embedding: list[float], top_k: int = 3) -> list[dict]:
+        """
+        Returns top_k chunks by cosine similarity.
+        Caller is responsible for generating query_embedding (OpenAI embeddings).
+        """
+        chunks = self.get_all_chunks()
+        scored: list[tuple[float, int, str]] = []
+        for chunk_id, content, emb in chunks:
+            sim = self._cosine(query_embedding, emb)
+            scored.append((sim, chunk_id, content))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = []
+        for sim, chunk_id, content in scored[:top_k]:
+            out.append({"chunk_id": chunk_id, "score": float(sim), "content": content})
         return out
 
     # --- broadcasts / pushes ---
