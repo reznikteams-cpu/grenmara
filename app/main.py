@@ -1,164 +1,109 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import sys
 import time
-from dataclasses import dataclass
+import traceback
 
-from telegram import Update
-from telegram.ext import ContextTypes
-
-from app.storage.repo import Repo
-from app.bot.keyboards import admin_kb, segments_kb
-from app.knowledge.ingest import KnowledgeIngestor
+# Фоллбек-логирование, чтобы не было "тишины", даже если setup_logging не отработал
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 log = logging.getLogger(__name__)
 
-
-@dataclass
-class AdminState:
-    mode: str = ""         # "broadcast_text" | "push_text" | "push_schedule" | "push_schedule_time"
-    segment: str = "all"
-    draft_text: str = ""
-
-
-ADMIN_STATE_KEY = "admin_state"
-
-
-def get_state(ctx: ContextTypes.DEFAULT_TYPE) -> AdminState:
-    st = ctx.user_data.get(ADMIN_STATE_KEY)
-    if not st:
-        st = AdminState()
-        ctx.user_data[ADMIN_STATE_KEY] = st
-    return st
+try:
+    from app.config import get_settings
+    from app.logging_setup import setup_logging
+    from app.storage.db import Database
+    from app.storage.schema import ensure_schema
+    from app.knowledge.ingest import KnowledgeIngestor
+    from app.bot.telegram_bot import build_application
+    from app.push.scheduler import SchedulerService
+except Exception as e:
+    print("FATAL: import failed in app.main.py:", repr(e), flush=True)
+    traceback.print_exc()
+    raise
 
 
-async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo) -> None:
-    await update.effective_message.reply_text("Админка:", reply_markup=admin_kb())
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in ("1", "true", "yes", "y", "on"):
+        return True
+    if raw in ("0", "false", "no", "n", "off", ""):
+        return False
+    log.warning("Env %s has unexpected value %r; treating as True", name, raw)
+    return True
 
 
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo) -> None:
-    total = repo.db.query("SELECT COUNT(*) AS c FROM users")[0]["c"]
-    active = repo.db.query("SELECT COUNT(*) AS c FROM users WHERE is_active_subscription=1")[0]["c"]
-    dormant = repo.db.query("SELECT COUNT(*) AS c FROM users WHERE last_seen_at < datetime('now','-7 day')")[0]["c"]
-    await update.effective_message.reply_text(
-        f"Пользователей: {total}\nАктивные подписки: {active}\nНеактивны 7д+: {dormant}"
-    )
-
-
-async def kb_reload(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, settings) -> None:
-    """
-    Полная переиндексация KB из Google Docs.
-    После успеха — помечаем KB как ready в app.kb.state.
-    """
-    await update.effective_message.reply_text("Обновляю KB…")
-
-    ing = KnowledgeIngestor(db=repo.db, settings=settings)
+def _set_kb_state(ready: bool) -> None:
     try:
-        indexed = await ing.reindex_all()
-
-        # sync in-memory KB readiness
-        try:
-            from app.kb.state import kb_mark_ready, kb_set_last_load_ts
-
-            kb_mark_ready(True if indexed > 0 else False)
+        from app.kb.state import kb_mark_ready, kb_set_last_load_ts
+        kb_mark_ready(bool(ready))
+        if ready:
             kb_set_last_load_ts(int(time.time()))
-        except Exception:
-            log.exception("Failed to mark KB state after kb_reload")
+    except Exception:
+        log.exception("Failed to update KB state")
 
-        if indexed > 0:
-            await update.effective_message.reply_text(f"KB обновлена ✅ (chunks: {indexed})")
-        else:
-            await update.effective_message.reply_text(
-                "KB обновлена, но получилась пустой ⚠️\n"
-                "Проверь GDOCS_SOURCES и доступ к документам."
-            )
 
-    except Exception as e:
-        # mark not ready on failure
+async def _startup_kb(db: Database, settings) -> int:
+    ingestor = KnowledgeIngestor(db=db, settings=settings)
+    indexed = await ingestor.ensure_indexed_once()
+    return int(indexed or 0)
+
+
+async def main() -> None:
+    # Жёсткий маркер старта, чтобы исключить "тишину"
+    print("MAIN: entered main()", flush=True)
+
+    settings = get_settings()
+    setup_logging(settings.log_level)
+
+    log.info("Starting bot...")
+
+    db = Database(settings.database_url)
+    ensure_schema(db)
+
+    kb_disable_startup = _env_flag("KB_DISABLE_STARTUP", default=False)
+    log.info("KB_DISABLE_STARTUP=%r (parsed=%s)", os.getenv("KB_DISABLE_STARTUP"), kb_disable_startup)
+
+    if kb_disable_startup:
+        log.warning("KB startup disabled by env KB_DISABLE_STARTUP")
+        _set_kb_state(False)
+    else:
         try:
-            from app.kb.state import kb_mark_ready
+            indexed = await _startup_kb(db, settings)
+            _set_kb_state(True)
+            log.info("KB warm start done (indexed=%s)", indexed)
+        except Exception as e:
+            _set_kb_state(False)
+            log.exception("KB startup failed, continuing without KB: %s", e)
 
-            kb_mark_ready(False)
-        except Exception:
-            pass
+    scheduler = SchedulerService(db=db, settings=settings)
+    scheduler.start()
 
-        log.exception("KB reload failed: %s", e)
-        await update.effective_message.reply_text(
-            "Ошибка при обновлении KB ❌\nСмотри логи сервера."
-        )
+    application = build_application(db=db, settings=settings, scheduler=scheduler)
+    await application.initialize()
+    await application.start()
 
+    log.info("Bot started. Listening...")
+    await application.updater.start_polling(drop_pending_updates=True)
 
-async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    st = get_state(context)
-    st.mode = "broadcast_text"
-    st.draft_text = ""
-    await update.effective_message.reply_text("Выбери сегмент для рассылки:", reply_markup=segments_kb("seg_bcast"))
-
-
-async def push_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    st = get_state(context)
-    st.mode = "push_text"
-    st.draft_text = ""
-    await update.effective_message.reply_text("Текст пуша (одним сообщением):")
+    while True:
+        await asyncio.sleep(3600)
 
 
-async def push_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    st = get_state(context)
-    st.mode = "push_schedule"
-    await update.effective_message.reply_text("Выбери сегмент:", reply_markup=segments_kb("seg_push"))
-
-
-async def on_segment_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo) -> None:
-    query = update.callback_query
-    await query.answer()
-    st = get_state(context)
-
-    data = query.data  # e.g. seg_bcast:active
-    prefix, seg = data.split(":", 1)
-    st.segment = seg
-
-    if prefix == "seg_bcast":
-        st.mode = "broadcast_text"
-        await query.message.reply_text(f"Ок, сегмент: {seg}\nТеперь отправь текст рассылки одним сообщением.")
-    elif prefix == "seg_push":
-        st.mode = "push_schedule_time"
-        await query.message.reply_text(
-            f"Сегмент: {seg}\nТеперь отправь дату/время запуска в формате: YYYY-MM-DD HH:MM\n(по локальному времени сервера)"
-        )
-
-
-async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, scheduler_service) -> None:
-    st = get_state(context)
-    text = (update.message.text or "").strip()
-    if not text:
-        return
-
-    if st.mode == "broadcast_text":
-        st.draft_text = text
-        bid = repo.create_broadcast(admin_id=update.effective_user.id, segment=st.segment, text=st.draft_text)
-        await update.message.reply_text(f"Рассылка создана (id={bid}). Начинаю отправку…")
-        await scheduler_service.send_broadcast_now(broadcast_id=bid, segment=st.segment, text=st.draft_text)
-        st.mode = ""
-        st.draft_text = ""
-        return
-
-    if st.mode == "push_text":
-        st.draft_text = text
-        await update.message.reply_text("Ок. Теперь /push_schedule чтобы запланировать, или отправь /admin.")
-        return
-
-    if st.mode == "push_schedule_time":
-        run_at = text  # expects "YYYY-MM-DD HH:MM"
-        if not st.draft_text:
-            await update.message.reply_text("Сначала создай текст пуша: /push_add")
-            return
-
-        pid = repo.create_scheduled_push(
-            admin_id=update.effective_user.id,
-            segment=st.segment,
-            text=st.draft_text,
-            run_at_iso=run_at,
-        )
-        await update.message.reply_text(f"Запланировано ✅ push_id={pid} на {run_at} сегмент={st.segment}")
-        st.mode = ""
-        return
+if __name__ == "__main__":
+    try:
+        print("MAIN: __main__ reached, starting asyncio.run(main())", flush=True)
+        asyncio.run(main())
+    except Exception as e:
+        print("FATAL: app crashed:", repr(e), flush=True)
+        traceback.print_exc()
+        sys.exit(1)
