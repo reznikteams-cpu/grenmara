@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import logging
+import re
+from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
 
-# stages
-STAGE_SITUATION = "situation"
 STAGE_FEELINGS = "feelings"
 STAGE_ANIMAL = "animal"
-STAGE_HYPOTHESIS = "hypothesis"
+STAGE_ANIMAL_SELF = "animal_self"
+STAGE_ANALYSIS = "analysis"
+STAGE_DONE = "done"
 
 
-# ---------- helpers ----------
-def _ud(context) -> dict:
-    # per-user memory; survives within bot process
+def _ud(context: ContextTypes.DEFAULT_TYPE) -> dict:
     if context.user_data is None:
         context.user_data = {}
     return context.user_data
@@ -23,96 +23,93 @@ def _is_positive_feelings(text: str) -> bool:
     t = (text or "").lower()
     positives = ["рад", "радость", "лёгк", "легк", "кайф", "вдохнов", "спокой", "уверен", "приятн"]
     negatives = ["тревог", "страх", "злост", "гнев", "обид", "тяжест", "оцепен", "апат", "стыд", "вина", "напряж"]
-    # if contains any negative -> treat as negative
     if any(x in t for x in negatives):
         return False
     if any(x in t for x in positives):
         return True
-    # default: treat as negative to continue algorithm
     return False
 
 
-async def _kb_lookup_symbolism(repo, query: str) -> str | None:
+def _looks_complex_scene(text: str) -> bool:
+    low = (text or "").lower()
+    markers = [",", " и ", " рядом", " напротив", " вместе", " нападает", " дерутся", " сраж", " кусает", " гонит", " убег", " в лесу", " в воде", " в доме"]
+    return any(m in low for m in markers)
+
+
+def _extract_symbolism_entry(raw_text: str, key: str) -> str | None:
     """
-    Tries to retrieve symbolism entry from your KB.
-    You may have different repo methods; we attempt several names.
+    Пытаемся вытащить блок по ключу (животное/символ).
+    Алгоритм: найти строку, начинающуюся с ключа (или где ключ отдельным словом),
+    затем вернуть следующие строки до пустой строки/следующего заголовка.
     """
-    q = (query or "").strip()
-    if not q:
+    if not raw_text or not key:
         return None
 
-    # try common method names
-    for name in ("kb_search", "search_kb", "knowledge_search", "rag_search", "search_knowledge"):
-        fn = getattr(repo, name, None)
-        if callable(fn):
-            try:
-                res = fn(q)
-                # allow async or sync
-                if hasattr(res, "__await__"):
-                    res = await res
-                if not res:
-                    return None
-                # if repo returns list of chunks
-                if isinstance(res, list):
-                    # take top 1-3 chunks
-                    parts = []
-                    for item in res[:3]:
-                        if isinstance(item, str):
-                            parts.append(item)
-                        elif isinstance(item, dict):
-                            parts.append(item.get("text") or item.get("content") or "")
-                        else:
-                            parts.append(str(item))
-                    txt = "\n\n".join([p for p in parts if p.strip()])
-                    return txt.strip() or None
-                # if returns string
-                if isinstance(res, str):
-                    return res.strip() or None
-                # fallback
-                return str(res).strip() or None
-            except Exception:
-                log.exception("KB lookup failed for query=%r via %s", q, name)
-                return None
+    lines = raw_text.splitlines()
+    k = key.strip().lower()
 
-    return None
+    # match line that starts with key or contains it as whole word
+    start_idx = None
+    for i, ln in enumerate(lines):
+        l = ln.strip()
+        if not l:
+            continue
+        ll = l.lower()
+        if ll.startswith(k) or re.search(rf"\b{re.escape(k)}\b", ll):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return None
+
+    out = []
+    out.append(lines[start_idx].rstrip())
+
+    for j in range(start_idx + 1, min(start_idx + 80, len(lines))):
+        ln = lines[j].rstrip()
+        if not ln.strip():
+            # stop at first empty line after we started collecting some content
+            if len(out) > 1:
+                break
+            continue
+        # heuristic stop on next strong heading
+        if re.match(r"^[A-ZА-ЯЁ0-9🐘🦊🐺🦁🦅🦂🕷️].{0,40}$", ln.strip()) and len(out) > 3:
+            break
+        out.append(ln)
+
+    text = "\n".join(out).strip()
+    return text if text else None
 
 
-# ---------- commands ----------
 async def start(update, context, repo, settings):
     ud = _ud(context)
     ud.clear()
-    ud["stage"] = STAGE_SITUATION
-
+    ud["stage"] = STAGE_FEELINGS
     await update.effective_message.reply_text(
-        "Опиши ситуацию/запрос одним сообщением.\n\n"
-        "Я задам вопросы по методике «Истинный запрос»."
+        'Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.'
     )
 
 
 async def help_cmd(update, context):
     await update.effective_message.reply_text(
-        "Команды:\n"
-        "/start — начать заново\n"
-        "/clear — сбросить диалог\n"
-        "/profile — профиль\n"
+        "/start — начать\n"
+        "/clear — сбросить\n"
     )
+
+
+async def clear(update, context, repo):
+    _ud(context).clear()
+    await update.effective_message.reply_text("Сбросила. Напиши /start чтобы начать заново.")
 
 
 async def profile(update, context, repo, settings):
     await update.effective_message.reply_text("Профиль: в разработке.")
 
 
-async def clear(update, context, repo):
-    ud = _ud(context)
-    ud.clear()
-    await update.effective_message.reply_text("Ок, сбросила. Напиши /start чтобы начать заново.")
-
-
 async def subscribe(update, context):
     await update.effective_message.reply_text("Подписка: в разработке.")
 
 
-# ---------- main flow ----------
 async def text_message(update, context, repo, settings):
     msg = update.effective_message
     text = (msg.text or "").strip()
@@ -120,110 +117,118 @@ async def text_message(update, context, repo, settings):
         return
 
     ud = _ud(context)
-    stage = ud.get("stage") or STAGE_SITUATION
+    stage = ud.get("stage") or STAGE_FEELINGS
 
-    # 0) Situation (not in your excerpt, but needed to anchor "this situation")
-    if stage == STAGE_SITUATION:
-        ud["situation"] = text
-        ud["stage"] = STAGE_FEELINGS
-        await msg.reply_text('Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.')
-        return
-
-    # 1) Feelings
+    # Этап 1: чувства
     if stage == STAGE_FEELINGS:
         ud["feelings"] = text
 
+        # позитивные чувства => сразу гипотеза (Этап 4), пропуская зверя
         if _is_positive_feelings(text):
-            ud["stage"] = STAGE_HYPOTHESIS
-            # go straight to hypothesis (skip animal)
-            await _send_hypothesis(update, context, repo, settings, skip_animal=True)
+            ud["stage"] = STAGE_ANALYSIS
+            ud["animal_scene"] = None
+            ud["animal_self"] = None
+            await _send_hypothesis_strict(update, context, repo, settings)
+            ud["stage"] = STAGE_DONE
             return
 
+        # негативные/напряжённые => Этап 2: зверь
         ud["stage"] = STAGE_ANIMAL
-        await msg.reply_text("Представь, что ты — зверь, который это чувствует. Какой зверь пришёл? Где он находится? Что он делает?")
-        return
-
-    # 2) Animal
-    if stage == STAGE_ANIMAL:
-        ud["animal_scene"] = text
-
-        # if multiple animals/scene -> ask уточнение (as per prompt)
-        low = text.lower()
-        multi_markers = [",", " и ", " рядом", " напротив", " вместе", " нападает", " гонит", " дерутся", " сраж", " кусает"]
-        if any(m in low for m in multi_markers):
-            ud["stage"] = STAGE_ANIMAL  # keep, but expect "who am I"
-            ud["need_self"] = True
-            await msg.reply_text("Кем ты себя ощущаешь в этой картинке?")
-            return
-
-        # otherwise proceed to symbolism analysis -> hypothesis
-        ud["stage"] = STAGE_HYPOTHESIS
-        await _send_hypothesis(update, context, repo, settings, skip_animal=False)
-        return
-
-    # if waiting for "who am I" уточнение
-    if stage == STAGE_ANIMAL and ud.get("need_self"):
-        ud["animal_self"] = text
-        ud["need_self"] = False
-        ud["stage"] = STAGE_HYPOTHESIS
-        await _send_hypothesis(update, context, repo, settings, skip_animal=False)
-        return
-
-    # 4) Hypothesis stage: treat as new situation unless user explicitly continues
-    # (so bot never "stops" after 1 cycle)
-    ud.clear()
-    ud["stage"] = STAGE_SITUATION
-    ud["situation"] = text
-    ud["stage"] = STAGE_FEELINGS
-    await msg.reply_text('Приняла. Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.')
-
-
-async def _send_hypothesis(update, context, repo, settings, skip_animal: bool):
-    msg = update.effective_message
-    ud = _ud(context)
-
-    situation = ud.get("situation", "—")
-    feelings = ud.get("feelings", "—")
-    animal_scene = ud.get("animal_scene", "") if not skip_animal else ""
-    animal_self = ud.get("animal_self", "")
-
-    # symbolism lookup (strictly from file: we use KB)
-    symbolism_text = None
-    if not skip_animal and animal_scene:
-        symbolism_text = await _kb_lookup_symbolism(repo, animal_scene)
-
-    # If KB not available, we must not invent symbolism
-    if not skip_animal and animal_scene and not symbolism_text:
         await msg.reply_text(
-            "Я вижу образ, но сейчас не могу безопасно расшифровать его по «Символизму» (нет доступа к базе символов в боте).\n\n"
-            "Проверь, что база знаний загружена (kb_reload) или включи доступ к «Символизм» в KB.\n"
-            "Пока — зафиксирую данные и задам следующий вопрос по алгоритму:\n\n"
-            "Для чего тебе мог быть нужен этот опыт? Что он показывает твоей психике?"
+            "Представь, что ты — зверь, который это чувствует. Какой зверь пришёл? Где он находится? Что он делает?"
         )
         return
 
-    # compose hypothesis without adding external knowledge
+    # Этап 2: зверь
+    if stage == STAGE_ANIMAL:
+        ud["animal_scene"] = text
+
+        if _looks_complex_scene(text):
+            ud["stage"] = STAGE_ANIMAL_SELF
+            await msg.reply_text("Кем ты себя ощущаешь в этой картинке?")
+            return
+
+        ud["animal_self"] = None
+        ud["stage"] = STAGE_ANALYSIS
+        await _send_hypothesis_strict(update, context, repo, settings)
+        ud["stage"] = STAGE_DONE
+        return
+
+    # уточнение "Кем ты себя ощущаешь"
+    if stage == STAGE_ANIMAL_SELF:
+        ud["animal_self"] = text
+        ud["stage"] = STAGE_ANALYSIS
+        await _send_hypothesis_strict(update, context, repo, settings)
+        ud["stage"] = STAGE_DONE
+        return
+
+    # если пользователь пишет дальше — начинаем заново с Этапа 1 (без лишних вопросов)
+    ud.clear()
+    ud["stage"] = STAGE_FEELINGS
+    await msg.reply_text('Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.')
+
+
+async def _send_hypothesis_strict(update, context, repo, settings):
+    """
+    Строго: символизм и вопросы берём ТОЛЬКО из файла "Символизм" (в KB как raw_text).
+    Никаких внешних вопросов (включая "Для чего..."), только гипотеза.
+    """
+    msg = update.effective_message
+    ud = _ud(context)
+
+    feelings = ud.get("feelings") or "—"
+    animal_scene = ud.get("animal_scene")
+    animal_self = ud.get("animal_self")
+
+    # 1) получить текст "Символизма" из KB
+    symbolism_raw = repo.get_document_raw_text_by_title("symbolism")
+    if not symbolism_raw:
+        # fallback: если у тебя title другой — можно заменить тут на точный
+        symbolism_raw = repo.get_document_raw_text_by_title("Символизм")
+
+    if animal_scene:
+        # 2) простой образ: если одно слово — пытаемся найти entry
+        #    иначе ищем по ключевому слову (первое "животное-похожее" слово)
+        key = animal_scene.strip()
+        if " " in key:
+            # crude key guess: take first token (лучше потом улучшить под формат файла)
+            key = key.split()[0]
+
+        entry = _extract_symbolism_entry(symbolism_raw or "", key) if symbolism_raw else None
+
+        if not entry:
+            # строго: не домысливаем. просто сообщаем, что в файле не найдено.
+            await msg.reply_text(
+                "Не нашла этот образ в файле «Символизм» (в базе знаний). "
+                "Чтобы я продолжила строго по структуре, образ должен совпасть с формулировкой/словом из файла."
+            )
+            return
+
+        # 3) отдать символический блок (и только его формулировки)
+        parts = []
+        parts.append("**Этап 3: Символический анализ (по файлу «Символизм»)**")
+        parts.append(entry)
+
+        # 4) гипотеза (без добавочных вопросов)
+        parts.append("\n**Этап 4: Гипотеза**")
+        parts.append(
+            "Связка:\n"
+            f"— Чувства/реакция: {feelings}\n"
+            f"— Образ: {animal_scene}\n"
+            "— Значения и уточнения: см. блок символизма выше.\n\n"
+            "Гипотеза формулируется на основе этих трёх уровней. "
+            "Если нужно — уточнения задаются только теми вопросами, которые уже перечислены в блоке «Символизм»."
+        )
+
+        await msg.reply_text("\n\n".join(parts), parse_mode="Markdown")
+        return
+
+    # Если зверя не было (позитивные чувства => Этап 4 сразу), то гипотеза без символизма
     parts = []
-    parts.append(f"**Запрос / ситуация:** {situation}")
-    parts.append(f"**Чувства и телесные ощущения:** {feelings}")
-
-    if not skip_animal:
-        parts.append(f"**Образ зверя / сцена:** {animal_scene}")
-        if animal_self:
-            parts.append(f"**Кем ты себя ощущаешь в картинке:** {animal_self}")
-
-        parts.append("**Символический разбор (по файлу «Символизм»):**")
-        parts.append(symbolism_text.strip())
-
-    parts.append("\n**Гипотеза (сборка 3 уровней):**")
+    parts.append("**Этап 4: Гипотеза**")
     parts.append(
-        "Это может быть ситуация, где проявляется внутренний паттерн, связанный с тем, как ты переживаешь напряжение/опасность/контакт в этой истории. "
-        "Чтобы не додумывать, я проверю через смысл опыта."
-        if not skip_animal else
-        "Раз чувства в основном ресурсные/позитивные, я собираю гипотезу напрямую через смысл опыта, без образа зверя."
+        "По алгоритму при ресурсных/позитивных чувствах этап зверя пропускается.\n"
+        f"— Чувства/ощущения: {feelings}\n"
+        "Гипотеза формулируется только на основе запроса и реакций, без символического разбора."
     )
-
-    parts.append("\n**Вопрос:**")
-    parts.append("Для чего тебе мог быть нужен этот опыт? Что он показывает твоей психике?")
-
     await msg.reply_text("\n\n".join(parts), parse_mode="Markdown")
