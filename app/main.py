@@ -33,28 +33,31 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return True
 
 
-async def _startup_kb(db: Database, settings) -> None:
+def _set_kb_state(ready: bool) -> None:
+    """
+    Синхронизация in-memory состояния KB.
+    Не должна ронять приложение.
+    """
+    try:
+        from app.kb.state import kb_mark_ready, kb_set_last_load_ts
+
+        kb_mark_ready(bool(ready))
+        if ready:
+            kb_set_last_load_ts(int(time.time()))
+    except Exception:
+        log.exception("Failed to update app.kb.state (ready=%s)", ready)
+
+
+async def _startup_kb(db: Database, settings) -> int:
     """
     Прогреваем/индексируем KB на старте.
-    ВАЖНО: после успешной прогрузки синхронизируем readiness-флаг в app.kb.state,
-    чтобы остальная система не считала KB "не готовой".
+    Возвращает количество чанков, записанных в БД в рамках этого запуска (0 если чанки уже были).
     """
     t0 = time.time()
     ingestor = KnowledgeIngestor(db=db, settings=settings)
-    await ingestor.ensure_indexed_once()
-
-    # Синхронизация состояния KB (если модуль есть — он у тебя точно есть, т.к. lazy_loader его импортирует)
-    try:
-        from app.kb.state import kb_mark_ready, kb_set_last_load_ts  # локальный импорт: избежать циклов импорта
-
-        kb_mark_ready(True)
-        kb_set_last_load_ts(int(time.time()))
-    except Exception as e:
-        # Даже если readiness не смогли отметить — лучше продолжать, но явно залогировать,
-        # иначе потом будут "магические" lazy-load'ы и ощущение что KB не грузится.
-        log.warning("KB warm start done, but failed to mark KB ready in app.kb.state: %s", e)
-
-    log.info("KB warm start success in %.2fs", time.time() - t0)
+    indexed = await ingestor.ensure_indexed_once()
+    log.info("KB warm start finished in %.2fs (indexed=%s)", time.time() - t0, indexed)
+    return int(indexed or 0)
 
 
 async def main() -> None:
@@ -65,30 +68,32 @@ async def main() -> None:
     db = Database(settings.database_url)
     ensure_schema(db)
 
-    # KB warm start (не роняем весь бот, но делаем поведение предсказуемым)
     kb_disable_startup = _env_flag("KB_DISABLE_STARTUP", default=False)
-    log.info("KB_DISABLE_STARTUP=%r (parsed=%s)", os.getenv("KB_DISABLE_STARTUP"), kb_disable_startup)
+    log.info(
+        "KB_DISABLE_STARTUP=%r (parsed=%s)",
+        os.getenv("KB_DISABLE_STARTUP"),
+        kb_disable_startup,
+    )
 
+    # KB warm start (не роняем весь бот, но делаем состояние предсказуемым)
     if kb_disable_startup:
         log.warning("KB startup disabled by env KB_DISABLE_STARTUP")
-        # Если отключили стартап — явно отмечаем "не готово", чтобы логика была консистентной
-        try:
-            from app.kb.state import kb_mark_ready  # локальный импорт
-
-            kb_mark_ready(False)
-        except Exception:
-            pass
+        _set_kb_state(False)
     else:
         try:
-            await _startup_kb(db, settings)
-        except Exception as e:
-            # Важно: если стартап не удался — отмечаем неготовность, чтобы не было "полу-состояния"
-            try:
-                from app.kb.state import kb_mark_ready  # локальный импорт
+            indexed = await _startup_kb(db, settings)
 
-                kb_mark_ready(False)
-            except Exception:
-                pass
+            # Если в БД уже были чанки — indexed=0, но это не значит, что KB "не готова".
+            # Готовность здесь = возможность работать с KB (документы/чанки присутствуют).
+            # Поэтому: если старт прошёл без исключений — считаем ready=True.
+            _set_kb_state(True)
+
+            if indexed > 0:
+                log.info("KB warmed successfully (new chunks=%s)", indexed)
+            else:
+                log.info("KB already present (no new chunks indexed)")
+        except Exception as e:
+            _set_kb_state(False)
             log.exception("KB startup failed, continuing without KB: %s", e)
 
     scheduler = SchedulerService(db=db, settings=settings)
@@ -107,4 +112,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
