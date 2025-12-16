@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import logging
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -17,6 +19,9 @@ from app.bot.admin import (
 )
 from app.bot.middleware import is_admin
 
+log = logging.getLogger(__name__)
+
+
 def build_application(db: Database, settings, scheduler):
     repo = Repo(db)
 
@@ -26,14 +31,35 @@ def build_application(db: Database, settings, scheduler):
         .build()
     )
 
-    # user commands
-    application.add_handler(CommandHandler("start", lambda u,c: handlers.start(u,c,repo,settings)))
-    application.add_handler(CommandHandler("help", handlers.help_cmd))
-    application.add_handler(CommandHandler("profile", lambda u,c: handlers.profile(u,c,repo,settings)))
-    application.add_handler(CommandHandler("clear", lambda u,c: handlers.clear(u,c,repo)))
-    application.add_handler(CommandHandler("subscribe", handlers.subscribe))
+    # ---------- global error handler (CRITICAL) ----------
+    async def on_error(update, context):
+        log.exception("Unhandled error in update=%s", update, exc_info=context.error)
 
-    # admin commands
+    application.add_error_handler(on_error)
+
+    # ---------- user commands (NO lambdas) ----------
+    async def start_cmd(update, context):
+        await handlers.start(update, context, repo, settings)
+
+    async def help_cmd(update, context):
+        await handlers.help_cmd(update, context)
+
+    async def profile_cmd(update, context):
+        await handlers.profile(update, context, repo, settings)
+
+    async def clear_cmd(update, context):
+        await handlers.clear(update, context, repo)
+
+    async def subscribe_cmd(update, context):
+        await handlers.subscribe(update, context)
+
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("profile", profile_cmd))
+    application.add_handler(CommandHandler("clear", clear_cmd))
+    application.add_handler(CommandHandler("subscribe", subscribe_cmd))
+
+    # ---------- admin commands ----------
     async def admin_cmd(update, context):
         if not is_admin(update.effective_user.id, settings.admin_ids):
             return
@@ -71,10 +97,11 @@ def build_application(db: Database, settings, scheduler):
     application.add_handler(CommandHandler("push_add", push_add_cmd))
     application.add_handler(CommandHandler("push_schedule", push_schedule_cmd))
 
-    # callback queries
+    # ---------- callback queries ----------
     async def on_cb(update, context):
         q = update.callback_query
         data = q.data or ""
+
         if data == "profile":
             await handlers.profile(update, context, repo, settings)
         elif data == "clear":
@@ -98,14 +125,18 @@ def build_application(db: Database, settings, scheduler):
 
     application.add_handler(CallbackQueryHandler(on_cb))
 
-    # text messages
+    # ---------- text messages ----------
     async def on_text(update, context):
-        # if admin is in a wizard state, admin handler consumes text first
+        # admin wizard consumes first (if in mode), but should never block user flow
         if is_admin(update.effective_user.id, settings.admin_ids):
-            # try admin text handler; it will no-op if not in mode
-            await on_admin_text(update, context, repo, scheduler)
-        # always allow normal ai flow
+            try:
+                await on_admin_text(update, context, repo, scheduler)
+            except Exception:
+                log.exception("Admin text handler failed")
+
+        # normal flow
         await handlers.text_message(update, context, repo, settings)
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
     return application
