@@ -91,6 +91,12 @@ def build_application(db: Database, settings, scheduler):
             return
         await push_schedule_start(update, context)
 
+    async def symbolism_stats_cmd(update, context):
+    if not is_admin(update.effective_user.id, settings.admin_ids):
+        return
+    await symbolism_stats(update, context, repo)
+
+    application.add_handler(CommandHandler("symbolism_stats", symbolism_stats_cmd))
     application.add_handler(CommandHandler("admin", admin_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("kb_reload", kb_reload_cmd))
