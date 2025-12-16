@@ -1,108 +1,229 @@
 from __future__ import annotations
-import logging
-from telegram import Update
-from telegram.ext import ContextTypes
 
-from app.storage.repo import Repo
-from app.bot.keyboards import main_kb
-from app.bot.middleware import is_admin, touch_user
-from app.billing.access import can_use_ai
-from app.knowledge.embeddings import embed_query
-from app.knowledge.rag import top_k_chunks, build_context, llm_answer
+import logging
 
 log = logging.getLogger(__name__)
 
-SYSTEM_TEMPLATE = """Ты — ИИ-ассистент в Telegram.
-Отвечай полезно, но строго:
-- Используй ТОЛЬКО "Контекст из базы знаний", если он дан.
-- Если контекста недостаточно — скажи, что в базе знаний этого нет, и задай уточняющий вопрос.
-- Не выдумывай факты из базы знаний.
+# stages
+STAGE_SITUATION = "situation"
+STAGE_FEELINGS = "feelings"
+STAGE_ANIMAL = "animal"
+STAGE_HYPOTHESIS = "hypothesis"
 
-Контекст из базы знаний:
-{kb_context}
-"""
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, settings) -> None:
-    await touch_user(repo, update.effective_user)
-    adm = is_admin(update.effective_user.id, settings.admin_ids)
-    await update.message.reply_text(
-        "Привет 🤍 Напиши вопрос — я отвечу с опорой на мою базу знаний.\n"
-        "Команды: /help /profile /clear",
-        reply_markup=main_kb(adm),
+# ---------- helpers ----------
+def _ud(context) -> dict:
+    # per-user memory; survives within bot process
+    if context.user_data is None:
+        context.user_data = {}
+    return context.user_data
+
+
+def _is_positive_feelings(text: str) -> bool:
+    t = (text or "").lower()
+    positives = ["рад", "радость", "лёгк", "легк", "кайф", "вдохнов", "спокой", "уверен", "приятн"]
+    negatives = ["тревог", "страх", "злост", "гнев", "обид", "тяжест", "оцепен", "апат", "стыд", "вина", "напряж"]
+    # if contains any negative -> treat as negative
+    if any(x in t for x in negatives):
+        return False
+    if any(x in t for x in positives):
+        return True
+    # default: treat as negative to continue algorithm
+    return False
+
+
+async def _kb_lookup_symbolism(repo, query: str) -> str | None:
+    """
+    Tries to retrieve symbolism entry from your KB.
+    You may have different repo methods; we attempt several names.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    # try common method names
+    for name in ("kb_search", "search_kb", "knowledge_search", "rag_search", "search_knowledge"):
+        fn = getattr(repo, name, None)
+        if callable(fn):
+            try:
+                res = fn(q)
+                # allow async or sync
+                if hasattr(res, "__await__"):
+                    res = await res
+                if not res:
+                    return None
+                # if repo returns list of chunks
+                if isinstance(res, list):
+                    # take top 1-3 chunks
+                    parts = []
+                    for item in res[:3]:
+                        if isinstance(item, str):
+                            parts.append(item)
+                        elif isinstance(item, dict):
+                            parts.append(item.get("text") or item.get("content") or "")
+                        else:
+                            parts.append(str(item))
+                    txt = "\n\n".join([p for p in parts if p.strip()])
+                    return txt.strip() or None
+                # if returns string
+                if isinstance(res, str):
+                    return res.strip() or None
+                # fallback
+                return str(res).strip() or None
+            except Exception:
+                log.exception("KB lookup failed for query=%r via %s", q, name)
+                return None
+
+    return None
+
+
+# ---------- commands ----------
+async def start(update, context, repo, settings):
+    ud = _ud(context)
+    ud.clear()
+    ud["stage"] = STAGE_SITUATION
+
+    await update.effective_message.reply_text(
+        "Опиши ситуацию/запрос одним сообщением.\n\n"
+        "Я задам вопросы по методике «Истинный запрос»."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Я отвечаю на вопросы и опираюсь на базу знаний.\n"
-        "/profile — статус\n"
-        "/clear — очистить историю\n"
-        "/subscribe — оформить подписку (заглушка)\n"
+
+async def help_cmd(update, context):
+    await update.effective_message.reply_text(
+        "Команды:\n"
+        "/start — начать заново\n"
+        "/clear — сбросить диалог\n"
+        "/profile — профиль\n"
     )
 
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, settings) -> None:
-    await touch_user(repo, update.effective_user)
-    u = repo.get_user(update.effective_user.id)
-    if not u:
-        await update.message.reply_text("Профиль не найден.")
-        return
-    active = "активна ✅" if int(u["is_active_subscription"]) == 1 else "не активна ❌"
-    used = int(u["free_messages_used"] or 0)
-    await update.message.reply_text(
-        f"Подписка: {active}\n"
-        f"Демо-использовано: {used}/{settings.free_trial_messages}"
-    )
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo) -> None:
-    repo.clear_messages(update.effective_user.id)
-    await update.message.reply_text("История очищена ✅")
+async def profile(update, context, repo, settings):
+    await update.effective_message.reply_text("Профиль: в разработке.")
 
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # заглушка: тут подключаешь свою оплату/платформу/Telegram Stars/Robokassa webhook
-    await update.message.reply_text(
-        "Чтобы оформить подписку — подключи оплату в своём биллинге.\n"
-        "Если хочешь, скажи какой вариант: Stars / Robokassa / Stripe — и я под это дам код."
-    )
 
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, settings) -> None:
-    await touch_user(repo, update.effective_user)
-    user_id = update.effective_user.id
-    text = (update.message.text or "").strip()
+async def clear(update, context, repo):
+    ud = _ud(context)
+    ud.clear()
+    await update.effective_message.reply_text("Ок, сбросила. Напиши /start чтобы начать заново.")
+
+
+async def subscribe(update, context):
+    await update.effective_message.reply_text("Подписка: в разработке.")
+
+
+# ---------- main flow ----------
+async def text_message(update, context, repo, settings):
+    msg = update.effective_message
+    text = (msg.text or "").strip()
     if not text:
         return
 
-    allowed, note = can_use_ai(repo, user_id, settings.free_trial_messages)
-    if not allowed:
-        await update.message.reply_text(note)
+    ud = _ud(context)
+    stage = ud.get("stage") or STAGE_SITUATION
+
+    # 0) Situation (not in your excerpt, but needed to anchor "this situation")
+    if stage == STAGE_SITUATION:
+        ud["situation"] = text
+        ud["stage"] = STAGE_FEELINGS
+        await msg.reply_text('Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.')
         return
 
-    if int(repo.get_user(user_id)["is_active_subscription"]) == 0:
-        repo.inc_free_used(user_id)
+    # 1) Feelings
+    if stage == STAGE_FEELINGS:
+        ud["feelings"] = text
 
-    # store user message
-    repo.add_message(user_id, "user", text)
+        if _is_positive_feelings(text):
+            ud["stage"] = STAGE_HYPOTHESIS
+            # go straight to hypothesis (skip animal)
+            await _send_hypothesis(update, context, repo, settings, skip_animal=True)
+            return
 
-    # RAG retrieval
-    chunks = repo.get_all_chunks()
-    kb_context = ""
-    if chunks and settings.openai_api_key:
-        qemb = embed_query(settings.openai_api_key, settings.embedding_model, text)
-        top = top_k_chunks(qemb, chunks, settings.rag_top_k)
-        kb_context = build_context(top, settings.rag_max_chars)
+        ud["stage"] = STAGE_ANIMAL
+        await msg.reply_text("Представь, что ты — зверь, который это чувствует. Какой зверь пришёл? Где он находится? Что он делает?")
+        return
 
-    system = SYSTEM_TEMPLATE.format(kb_context=kb_context or "—")
-    history = repo.get_recent_messages(user_id, limit=16)
+    # 2) Animal
+    if stage == STAGE_ANIMAL:
+        ud["animal_scene"] = text
 
-    # Convert to Responses input format
-    msgs = [{"role": r["role"], "content": r["content"]} for r in history]
+        # if multiple animals/scene -> ask уточнение (as per prompt)
+        low = text.lower()
+        multi_markers = [",", " и ", " рядом", " напротив", " вместе", " нападает", " гонит", " дерутся", " сраж", " кусает"]
+        if any(m in low for m in multi_markers):
+            ud["stage"] = STAGE_ANIMAL  # keep, but expect "who am I"
+            ud["need_self"] = True
+            await msg.reply_text("Кем ты себя ощущаешь в этой картинке?")
+            return
 
-    answer = llm_answer(
-        api_key=settings.openai_api_key,
-        model=settings.openai_model,
-        system=system,
-        messages=msgs,
+        # otherwise proceed to symbolism analysis -> hypothesis
+        ud["stage"] = STAGE_HYPOTHESIS
+        await _send_hypothesis(update, context, repo, settings, skip_animal=False)
+        return
+
+    # if waiting for "who am I" уточнение
+    if stage == STAGE_ANIMAL and ud.get("need_self"):
+        ud["animal_self"] = text
+        ud["need_self"] = False
+        ud["stage"] = STAGE_HYPOTHESIS
+        await _send_hypothesis(update, context, repo, settings, skip_animal=False)
+        return
+
+    # 4) Hypothesis stage: treat as new situation unless user explicitly continues
+    # (so bot never "stops" after 1 cycle)
+    ud.clear()
+    ud["stage"] = STAGE_SITUATION
+    ud["situation"] = text
+    ud["stage"] = STAGE_FEELINGS
+    await msg.reply_text('Приняла. Что ты чувствуешь в этой ситуации? Напиши все чувства и телесные ощущения.')
+
+
+async def _send_hypothesis(update, context, repo, settings, skip_animal: bool):
+    msg = update.effective_message
+    ud = _ud(context)
+
+    situation = ud.get("situation", "—")
+    feelings = ud.get("feelings", "—")
+    animal_scene = ud.get("animal_scene", "") if not skip_animal else ""
+    animal_self = ud.get("animal_self", "")
+
+    # symbolism lookup (strictly from file: we use KB)
+    symbolism_text = None
+    if not skip_animal and animal_scene:
+        symbolism_text = await _kb_lookup_symbolism(repo, animal_scene)
+
+    # If KB not available, we must not invent symbolism
+    if not skip_animal and animal_scene and not symbolism_text:
+        await msg.reply_text(
+            "Я вижу образ, но сейчас не могу безопасно расшифровать его по «Символизму» (нет доступа к базе символов в боте).\n\n"
+            "Проверь, что база знаний загружена (kb_reload) или включи доступ к «Символизм» в KB.\n"
+            "Пока — зафиксирую данные и задам следующий вопрос по алгоритму:\n\n"
+            "Для чего тебе мог быть нужен этот опыт? Что он показывает твоей психике?"
+        )
+        return
+
+    # compose hypothesis without adding external knowledge
+    parts = []
+    parts.append(f"**Запрос / ситуация:** {situation}")
+    parts.append(f"**Чувства и телесные ощущения:** {feelings}")
+
+    if not skip_animal:
+        parts.append(f"**Образ зверя / сцена:** {animal_scene}")
+        if animal_self:
+            parts.append(f"**Кем ты себя ощущаешь в картинке:** {animal_self}")
+
+        parts.append("**Символический разбор (по файлу «Символизм»):**")
+        parts.append(symbolism_text.strip())
+
+    parts.append("\n**Гипотеза (сборка 3 уровней):**")
+    parts.append(
+        "Это может быть ситуация, где проявляется внутренний паттерн, связанный с тем, как ты переживаешь напряжение/опасность/контакт в этой истории. "
+        "Чтобы не додумывать, я проверю через смысл опыта."
+        if not skip_animal else
+        "Раз чувства в основном ресурсные/позитивные, я собираю гипотезу напрямую через смысл опыта, без образа зверя."
     )
 
-    repo.add_message(user_id, "assistant", answer)
-    if note:
-        answer = f"{answer}\n\n_{note}_"
-    await update.message.reply_text(answer)
+    parts.append("\n**Вопрос:**")
+    parts.append("Для чего тебе мог быть нужен этот опыт? Что он показывает твоей психике?")
+
+    await msg.reply_text("\n\n".join(parts), parse_mode="Markdown")
