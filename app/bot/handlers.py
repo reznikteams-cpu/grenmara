@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from telegram.ext import ContextTypes
 
 from app.knowledge.symbolism import (
@@ -8,6 +9,7 @@ from app.knowledge.symbolism import (
     find_symbol_entry,
     summarize_index,
 )
+from app.knowledge.ingest import KnowledgeIngestor
 
 log = logging.getLogger(__name__)
 
@@ -166,6 +168,36 @@ async def _notify_admins_missing_symbol(context, settings, user_id: int, usernam
             log.exception("Failed to notify admin_id=%s", aid)
 
 
+def _get_symbolism_raw(repo) -> str | None:
+    """
+    Нормализуем поиск по title: и английский, и русский.
+    """
+    return (
+        repo.get_document_raw_text_by_title("symbolism")
+        or repo.get_document_raw_text_by_title("Символизм")
+    )
+
+
+async def _try_reindex_kb(repo, settings) -> int:
+    """
+    Попытка восстановить KB, если в базе нет документа.
+    Возвращает число чанков, записанных при реиндексации.
+    """
+    ing = KnowledgeIngestor(db=repo.db, settings=settings)
+    indexed = await ing.reindex_all()
+
+    # sync in-memory readiness
+    try:
+        from app.kb.state import kb_mark_ready, kb_set_last_load_ts
+
+        kb_mark_ready(True if indexed > 0 else False)
+        kb_set_last_load_ts(int(time.time()))
+    except Exception:
+        log.exception("Failed to mark KB state after reindex attempt")
+
+    return indexed
+
+
 async def _send_hypothesis_strict(update, context, repo, settings):
     """
     Строго:
@@ -193,8 +225,17 @@ async def _send_hypothesis_strict(update, context, repo, settings):
         return
 
     # 2) Достаём сырой текст "Символизм" из KB (БД)
-    symbolism_raw = repo.get_document_raw_text_by_title("symbolism") \
-        or repo.get_document_raw_text_by_title("Символизм")
+    symbolism_raw = _get_symbolism_raw(repo)
+
+    # Если в БД нет документа — пробуем один раз восстановить KB из Google Docs
+    if not symbolism_raw:
+        try:
+            indexed = await _try_reindex_kb(repo, settings)
+            log.warning("Symbolism not found in DB. Reindex attempt wrote %s chunks.", indexed)
+        except Exception as e:
+            log.exception("Reindex attempt failed: %s", e)
+
+        symbolism_raw = _get_symbolism_raw(repo)
 
     if not symbolism_raw:
         await msg.reply_text("Файл «Символизм» не загружен в базу знаний.")
@@ -203,7 +244,7 @@ async def _send_hypothesis_strict(update, context, repo, settings):
             user_id=update.effective_user.id,
             username=update.effective_user.username,
             requested=animal_scene,
-            debug_hint="kb_documents missing title=symbolism"
+            debug_hint="kb_documents missing title=symbolism (even after reindex)"
         )
         return
 
@@ -212,13 +253,11 @@ async def _send_hypothesis_strict(update, context, repo, settings):
     found = find_symbol_entry(sym, animal_scene)
 
     if not found:
-        # Пользователю: строго и без домыслов
         await msg.reply_text(
             "Не нашла этот образ в файле «Символизм» (в базе знаний). "
             "Чтобы продолжить строго по структуре, образ должен совпасть с формулировкой/словом из файла."
         )
 
-        # Админам: сигнал + диагностика
         debug_hint = summarize_index(sym)
         await _notify_admins_missing_symbol(
             context, settings,
