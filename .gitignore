@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+data/
+*.sqlite
+.vscode/
+.idea/
+.DS_Store
