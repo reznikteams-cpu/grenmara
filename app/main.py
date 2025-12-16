@@ -25,7 +25,11 @@ async def main():
     ensure_schema(db)
 
     # KB warm start (one-time)
+    try:
     await _startup_kb(db, settings)
+except Exception as e:
+    log.exception("KB startup failed, continuing without KB: %s", e)
+
 
     # Scheduler
     scheduler = SchedulerService(db=db, settings=settings)
