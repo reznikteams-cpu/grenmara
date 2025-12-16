@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from app.config import get_settings
 from app.logging_setup import setup_logging
@@ -28,10 +29,13 @@ async def main() -> None:
     ensure_schema(db)
 
     # KB warm start (do not crash whole app if fails)
-    try:
-        await _startup_kb(db, settings)
-    except Exception as e:
-        log.exception("KB startup failed, continuing without KB: %s", e)
+    if os.getenv("KB_DISABLE_STARTUP") == "1":
+        log.warning("KB startup disabled by env KB_DISABLE_STARTUP=1")
+    else:
+        try:
+            await _startup_kb(db, settings)
+        except Exception as e:
+            log.exception("KB startup failed, continuing without KB: %s", e)
 
     scheduler = SchedulerService(db=db, settings=settings)
     scheduler.start()
