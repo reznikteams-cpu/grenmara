@@ -86,3 +86,27 @@ async def main() -> None:
         except Exception as e:
             _set_kb_state(False)
             log.exception("KB startup failed, continuing without KB: %s", e)
+
+    # === дальше у тебя этого НЕ БЫЛО ===
+
+    scheduler = SchedulerService(db=db, settings=settings)
+    scheduler.start()
+
+    application = build_application(
+        db=db,
+        settings=settings,
+        scheduler=scheduler,
+    )
+
+    await application.initialize()
+    await application.start()
+
+    log.info("Bot started. Listening...")
+    await application.updater.start_polling(drop_pending_updates=True)
+
+    while True:
+        await asyncio.sleep(3600)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
