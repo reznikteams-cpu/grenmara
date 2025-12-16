@@ -10,6 +10,7 @@ from telegram.ext import (
     filters,
 )
 
+from app.bot.admin_symbolism import symbolism_stats
 from app.storage.db import Database
 from app.storage.repo import Repo
 from app.bot import handlers
