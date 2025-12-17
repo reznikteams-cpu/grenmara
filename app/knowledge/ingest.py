@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Iterable
 
 from app.storage.db import Database
 from app.storage.repo import Repo
@@ -19,43 +20,73 @@ class KnowledgeIngestor:
 
     async def ensure_indexed_once(self) -> int:
         """
-        Если в БД уже есть чанки — ничего не делаем.
-        Возвращает число чанков, добавленных/переиндексированных в этом вызове (0 если не было работы).
+        Старое поведение: если нет chunks — индексируем.
+        Возвращает количество новых чанков (примерно).
         """
         rows = self.db.query("SELECT COUNT(*) AS c FROM kb_chunks")
         if int(rows[0]["c"]) > 0:
             return 0
         return await self.reindex_all()
 
-    async def reindex_all(self) -> int:
+    async def ensure_docs_loaded(self, titles: Iterable[str] | None = None) -> int:
         """
-        Полная переиндексация KB из источников (Google Docs).
-        Возвращает суммарное число чанков, записанных в БД.
+        НОВОЕ: гарантированно загружает raw_text документов в kb_documents (без эмбеддингов).
+        Это нужно, чтобы бот мог читать "Символизм" даже при KB_DISABLE_STARTUP=1 или без OPENAI_API_KEY.
+        Возвращает количество загруженных документов.
         """
         if not self.settings.gdocs_sources:
             log.warning("No GDOCS_SOURCES configured. KB will be empty.")
             return 0
 
-        if not self.settings.openai_api_key:
-            raise RuntimeError("OPENAI_API_KEY is required for embeddings/RAG")
+        wanted = None
+        if titles:
+            wanted = {t.strip().lower() for t in titles if t and t.strip()}
 
-        total_chunks_written = 0
-
+        loaded = 0
         for src in self.settings.gdocs_sources:
             doc_id = src["doc_id"]
-            title = src.get("title", doc_id)
+            title = (src.get("title") or doc_id).strip()
             fmt = src.get("format", "txt")
             source_key = f"gdocs:{doc_id}:{fmt}"
+
+            if wanted and title.strip().lower() not in wanted:
+                continue
 
             log.info("Loading doc %s (%s)...", title, doc_id)
             raw = export_doc_text(doc_id=doc_id, fmt=fmt)
 
+            # ВАЖНО: raw_text сохраняем всегда
+            self.repo.upsert_document(source_key=source_key, title=title, raw_text=raw)
+            loaded += 1
+
+        return loaded
+
+    async def reindex_all(self) -> int:
+        """
+        Индексирует всё: raw_text + chunks + embeddings (если есть OPENAI_API_KEY).
+        Если OPENAI_API_KEY нет — просто загрузит raw_text в kb_documents и завершит без падения.
+        """
+        # Сначала гарантируем raw_text
+        loaded = await self.ensure_docs_loaded()
+
+        # Если нет ключа — НЕ падаем. Для "Символизма" нам достаточно raw_text.
+        if not self.settings.openai_api_key:
+            log.warning("OPENAI_API_KEY is missing -> skipping embeddings/chunk indexing. raw_text loaded=%s", loaded)
+            return 0
+
+        total_chunks = 0
+        for src in self.settings.gdocs_sources:
+            doc_id = src["doc_id"]
+            title = (src.get("title") or doc_id).strip()
+            fmt = src.get("format", "txt")
+            source_key = f"gdocs:{doc_id}:{fmt}"
+
+            raw = export_doc_text(doc_id=doc_id, fmt=fmt)
             doc_db_id = self.repo.upsert_document(source_key=source_key, title=title, raw_text=raw)
 
             chunks = chunk_text(raw, chunk_size=1400, overlap=180)
             if not chunks:
                 log.warning("Doc %s has no chunks after chunking.", title)
-                # Важно: документ всё равно сохранили сырьём, но чанков нет
                 continue
 
             log.info("Embedding %d chunks for %s...", len(chunks), title)
@@ -68,8 +99,7 @@ class KnowledgeIngestor:
             packed = [(i, chunks[i], embs[i]) for i in range(len(chunks))]
             self.repo.replace_chunks(doc_id=doc_db_id, chunks=packed)
 
-            total_chunks_written += len(chunks)
+            total_chunks += len(chunks)
             log.info("Indexed %s: %d chunks", title, len(chunks))
 
-        log.info("KB reindex_all completed. Total chunks written: %d", total_chunks_written)
-        return total_chunks_written
+        return total_chunks
