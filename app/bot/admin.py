@@ -82,4 +82,80 @@ async def kb_reload(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Re
         except Exception:
             pass
         log.exception("KB reload failed: %s", e)
-        await update.effective_message.reply_text("Ошибка при об
+        await update.effective_message.reply_text("Ошибка при обновлении KB ❌ (см. логи)")
+
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_state(context)
+    st.mode = "broadcast_text"
+    st.draft_text = ""
+    await update.effective_message.reply_text("Выбери сегмент для рассылки:", reply_markup=segments_kb("seg_bcast"))
+
+
+async def push_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_state(context)
+    st.mode = "push_text"
+    st.draft_text = ""
+    await update.effective_message.reply_text("Текст пуша (одним сообщением):")
+
+
+async def push_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    st = get_state(context)
+    st.mode = "push_schedule"
+    await update.effective_message.reply_text("Выбери сегмент:", reply_markup=segments_kb("seg_push"))
+
+
+async def on_segment_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo) -> None:
+    query = update.callback_query
+    await query.answer()
+    st = get_state(context)
+
+    data = query.data  # e.g. seg_bcast:active
+    prefix, seg = data.split(":", 1)
+    st.segment = seg
+
+    if prefix == "seg_bcast":
+        st.mode = "broadcast_text"
+        await query.message.reply_text(f"Ок, сегмент: {seg}\nТеперь отправь текст рассылки одним сообщением.")
+    elif prefix == "seg_push":
+        st.mode = "push_schedule_time"
+        await query.message.reply_text(
+            f"Сегмент: {seg}\nТеперь отправь дату/время запуска в формате: YYYY-MM-DD HH:MM\n(по локальному времени сервера)"
+        )
+
+
+async def on_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE, repo: Repo, scheduler_service) -> None:
+    st = get_state(context)
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    if st.mode == "broadcast_text":
+        st.draft_text = text
+        bid = repo.create_broadcast(admin_id=update.effective_user.id, segment=st.segment, text=st.draft_text)
+        await update.message.reply_text(f"Рассылка создана (id={bid}). Начинаю отправку…")
+        await scheduler_service.send_broadcast_now(broadcast_id=bid, segment=st.segment, text=st.draft_text)
+        st.mode = ""
+        st.draft_text = ""
+        return
+
+    if st.mode == "push_text":
+        st.draft_text = text
+        await update.message.reply_text("Ок. Теперь /push_schedule чтобы запланировать, или отправь /admin.")
+        return
+
+    if st.mode == "push_schedule_time":
+        run_at = text  # expects "YYYY-MM-DD HH:MM"
+        if not st.draft_text:
+            await update.message.reply_text("Сначала создай текст пуша: /push_add")
+            return
+
+        pid = repo.create_scheduled_push(
+            admin_id=update.effective_user.id,
+            segment=st.segment,
+            text=st.draft_text,
+            run_at_iso=run_at,
+        )
+        await update.message.reply_text(f"Запланировано ✅ push_id={pid} на {run_at} сегмент={st.segment}")
+        st.mode = ""
+        return
