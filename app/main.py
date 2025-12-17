@@ -6,13 +6,13 @@ import os
 import sys
 import time
 import traceback
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Фоллбек-логирование, чтобы не было "тишины", даже если setup_logging не отработал
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 log = logging.getLogger(__name__)
 
 try:
@@ -27,6 +27,29 @@ except Exception as e:
     print("FATAL: import failed in app.main.py:", repr(e), flush=True)
     traceback.print_exc()
     raise
+
+
+def _start_health_server() -> None:
+    """
+    Railway Web Service часто ждёт, что процесс слушает $PORT.
+    Этот мини-сервер отвечает 200 OK и предотвращает рестарты.
+    """
+    port = int(os.getenv("PORT", "8080"))
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(self, format, *args):
+            return  # не спамим логи
+
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -59,11 +82,13 @@ async def _startup_kb(db: Database, settings) -> int:
 
 
 async def main() -> None:
-    # Жёсткий маркер старта, чтобы исключить "тишину"
     print("MAIN: entered main()", flush=True)
 
     settings = get_settings()
     setup_logging(settings.log_level)
+
+    # <<< ключевой фикс для Railway Web >>>
+    _start_health_server()
 
     log.info("Starting bot...")
 
