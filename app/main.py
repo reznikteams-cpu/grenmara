@@ -117,6 +117,12 @@ async def main() -> None:
     await application.initialize()
     await application.start()
 
+    try:
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+    log.exception("delete_webhook failed")
+
+    
     log.info("Bot started. Listening...")
     await application.updater.start_polling(drop_pending_updates=True)
 
