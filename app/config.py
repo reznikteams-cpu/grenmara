@@ -1,10 +1,13 @@
 from __future__ import annotations
 import json
+import logging
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Settings:
@@ -31,13 +34,20 @@ def _parse_admin_ids(raw: str) -> set[int]:
         x = x.strip()
         if not x:
             continue
-        ids.add(int(x))
+        try:
+            ids.add(int(x))
+        except ValueError:
+            log.warning("Invalid admin id in ADMIN_IDS: %r (skipping)", x)
     return ids
 
 def _parse_json(raw: str, default):
     if not raw:
         return default
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except Exception:
+        log.warning("Failed to parse JSON from env; using default instead", exc_info=True)
+        return default
 
 def get_settings() -> Settings:
     return Settings(
