@@ -1,3 +1,6 @@
+import os, socket
+log.info("BOOT pid=%s host=%s", os.getpid(), socket.gethostname())
+
 from __future__ import annotations
 
 import asyncio
