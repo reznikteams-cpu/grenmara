@@ -1,6 +1,3 @@
-import os, socket
-log.info("BOOT pid=%s host=%s", os.getpid(), socket.gethostname())
-
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +7,7 @@ import sys
 import time
 import traceback
 import threading
+import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 logging.basicConfig(
@@ -17,6 +15,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# Лог "BOOT" — только ПОСЛЕ создания log
+log.info("BOOT pid=%s host=%s", os.getpid(), socket.gethostname())
 
 try:
     from app.config import get_settings
@@ -90,7 +91,7 @@ async def main() -> None:
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    # <<< ключевой фикс для Railway Web >>>
+    # Railway Web требует порт
     _start_health_server()
 
     log.info("Starting bot...")
@@ -117,20 +118,38 @@ async def main() -> None:
     scheduler.start()
 
     application = build_application(db=db, settings=settings, scheduler=scheduler)
+
+    # ВАЖНО: delete_webhook делаем ДО polling, но ПОСЛЕ initialize()
     await application.initialize()
-    await application.start()
 
     try:
-    await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (drop_pending_updates=True)")
     except Exception:
-    log.exception("delete_webhook failed")
+        log.exception("delete_webhook failed (continuing)")
 
-    
+    await application.start()
+
     log.info("Bot started. Listening...")
     await application.updater.start_polling(drop_pending_updates=True)
 
-    while True:
-        await asyncio.sleep(3600)
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        # аккуратный shutdown (чтобы не было overlap и конфликтов при рестарте)
+        try:
+            await application.updater.stop()
+        except Exception:
+            pass
+        try:
+            await application.stop()
+        except Exception:
+            pass
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
