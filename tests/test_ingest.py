@@ -29,3 +29,25 @@ def test_ensure_docs_loaded_skips_cached_document(monkeypatch, tmp_path):
 
     assert loaded == 0
     assert repo.get_document_raw_text_by_source_key("gdocs:doc1:txt") == "cached text"
+
+
+def test_ensure_indexed_once_with_missing_api_key_avoids_reingest(monkeypatch, tmp_path):
+    db_path = tmp_path / "bot.sqlite"
+    db = Database(f"sqlite:///{db_path}")
+    ensure_schema(db)
+
+    repo = Repo(db)
+    repo.upsert_document(source_key="gdocs:doc1:txt", title="Doc 1", raw_text="cached text")
+
+    settings = SimpleNamespace(gdocs_sources=[{"doc_id": "doc1", "title": "Doc 1", "format": "txt"}], openai_api_key=None)
+    ingestor = KnowledgeIngestor(db=db, settings=settings)
+
+    def _fail_export(*args, **kwargs):
+        raise AssertionError("export_doc_text should not be called when OPENAI_API_KEY is missing")
+
+    monkeypatch.setattr("app.knowledge.ingest.export_doc_text", _fail_export)
+
+    loaded = asyncio.run(ingestor.ensure_indexed_once())
+
+    assert loaded == 0
+    assert repo.get_document_raw_text_by_source_key("gdocs:doc1:txt") == "cached text"

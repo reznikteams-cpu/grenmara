@@ -23,6 +23,18 @@ class KnowledgeIngestor:
         Старое поведение: если нет chunks — индексируем.
         Возвращает количество новых чанков (примерно).
         """
+        # Всегда гарантируем, что raw_text загружен — без этого бот не сможет отвечать
+        # даже если эмбеддинги недоступны.
+        loaded_raw = await self.ensure_docs_loaded()
+
+        # Если нет ключа — ограничиваемся только загрузкой raw_text (без reindex_all())
+        if not self.settings.openai_api_key:
+            log.warning(
+                "OPENAI_API_KEY is missing -> skipping embeddings/chunk indexing. raw_text loaded=%s",
+                loaded_raw,
+            )
+            return loaded_raw
+
         rows = self.db.query("SELECT COUNT(*) AS c FROM kb_chunks")
         if int(rows[0]["c"]) > 0:
             return 0
