@@ -52,6 +52,11 @@ class KnowledgeIngestor:
             if wanted and title.strip().lower() not in wanted:
                 continue
 
+            existing_raw = self.repo.get_document_raw_text_by_source_key(source_key)
+            if existing_raw and existing_raw.strip():
+                log.info("Document %s already loaded, skipping download", title)
+                continue
+
             log.info("Loading doc %s (%s)...", title, doc_id)
             raw = export_doc_text(doc_id=doc_id, fmt=fmt)
 

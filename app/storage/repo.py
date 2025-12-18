@@ -99,6 +99,15 @@ class Repo:
             return None
         return rows[0]["raw_text"]
 
+    def get_document_raw_text_by_source_key(self, source_key: str) -> str | None:
+        rows = self.db.query(
+            "SELECT raw_text FROM kb_documents WHERE source_key=? LIMIT 1",
+            (source_key,),
+        )
+        if not rows:
+            return None
+        return rows[0]["raw_text"]
+
     def get_document_raw_text_by_source_key_prefix(self, prefix: str) -> str | None:
         # e.g. prefix "gdocs:...:" if you want
         rows = self.db.query(
