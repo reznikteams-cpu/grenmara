@@ -98,7 +98,14 @@ class KnowledgeIngestor:
             fmt = src.get("format", "txt")
             source_key = f"gdocs:{doc_id}:{fmt}"
 
-            raw = export_doc_text(doc_id=doc_id, fmt=fmt)
+            existing_raw = self.repo.get_document_raw_text_by_source_key(source_key)
+            if existing_raw and existing_raw.strip():
+                log.info("Using cached raw text for %s", title)
+                raw = existing_raw
+            else:
+                log.info("Loading doc %s (%s)...", title, doc_id)
+                raw = export_doc_text(doc_id=doc_id, fmt=fmt)
+
             doc_db_id = self.repo.upsert_document(source_key=source_key, title=title, raw_text=raw)
 
             chunks = chunk_text(raw, chunk_size=1400, overlap=180)
