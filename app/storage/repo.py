@@ -77,7 +77,24 @@ class Repo:
 
     # --- NEW: read raw document text (needed for "Символизм" exact phrasing/questions) ---
     def get_document_raw_text_by_title(self, title: str) -> str | None:
-        rows = self.db.query("SELECT raw_text FROM kb_documents WHERE title=? ORDER BY id DESC LIMIT 1", (title,))
+        """
+        Возвращает документ по title без учета регистра.
+
+        В gdocs_sources админы иногда задают title как "Symbolism" или
+        "Символизм" с заглавной буквы, а при поиске мы используем нижний регистр
+        ("symbolism"). Поэтому сравниваем в LOWER(...) чтобы не зависеть от
+        регистра и лишних пробелов.
+        """
+        rows = self.db.query(
+            """
+            SELECT raw_text
+            FROM kb_documents
+            WHERE lower(title) = lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (title.strip(),),
+        )
         if not rows:
             return None
         return rows[0]["raw_text"]
